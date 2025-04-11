@@ -9,24 +9,10 @@ Additionally, we believe that the multimodal generalization algorithms proposed 
 
 # To run our code
 
-1. download the dataset and pretrained models from Onedrive([datasets_pretrain_models.zip](https://portland-my.sharepoint.com/:u:/g/personal/liuhui3-c_my_cityu_edu_hk/ESqS-qpzsYJGoawSrzKDOlcBWr5e2plKA47L1JX0zsF4Ug?e=Gqu5Qi)) and unzip them in  this project dir.
-
-2. drive_outmodel.py is the main file to drive our algorithms. Please remove the codes related to comel package that enable efficient management of ML experiments or add your api_key and other parameters in the below codes in this file:
-
-   ```python
-    experiment = Experiment(
-           api_key="",
-           project_name="",
-           workspace="",
-       )
-   ```
-
-3. Multimodal JMMD, in our work, devised for multimodal  generalization tasks, can capture cross-modal correlations among multiple modalities with theoretical guarantees. For better implement, I advise to use the implement of MMD in domainbed that fix the parameter of kernels and only adjust the weight of JMMD loss function $\lambda_1$. Otherwise, you can just use my implement to set the kernel manually.
-
-4. At last, you can run our codes as below:
+You can run our codes as below:
 
    ```
-   sh multi_out_model.sh
+   sh train.sh
    ```
 
 # Citation
