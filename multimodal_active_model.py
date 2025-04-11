@@ -13,10 +13,10 @@ import random
 import torch.nn.functional as F
 from utils.logger import setup_logger, MetricLogger
 from utils.eutils import seed_everything, get_merge_source_target_ds, get_dataloader, get_three_source_iter, get_target_ds
-from model.classify_model import HyperModel_TextCnn, MLPModel_TextCnn, JointModel_TextCnn
+from model.classify_model import JointModel_TextCnn2, DomainDiscriminator, grad_reverse
 from model.active import EDL_Loss, active_select
 from model.jmmd import JointMultipleKernelMaximumMeanDiscrepancy, GaussianKernel
-from model.contrastive_loss import Intro_alignment_loss, compute_nego_loss
+from model.contrastive_loss import compute_nego_loss, compute_domain_adversarial_loss, compute_contrastive_loss
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 
@@ -68,10 +68,10 @@ def get_parser():
                         help="The embedding mode of textcnn")
     parser.add_argument('--lr', type=float, default=1e-3, help='initial learning rate')
     parser.add_argument('--wd', type=float, default=5e-4, help='weight decay (default: 5e-4)')
-    parser.add_argument('--active_round', type=int, nargs='+', default=[10, 12, 14, 16, 18],
+    parser.add_argument('--active_round', type=int, nargs='+', default=[6, 8, 10, 12, 14],
                         help='trainer active round')
     parser.add_argument('--z_dim', type=int, default=256, help='network dim')
-    parser.add_argument('--train_epochs', type=int, default=20, help='number of total epochs to train')
+    parser.add_argument('--train_epochs', type=int, default=30, help='number of total epochs to train')
     parser.add_argument('--adapt_epochs', type=int, default=20, help='number of total epochs to adapt')
     parser.add_argument('--num_labels', type=int, default=2, help='The number of labels of classifier')
     parser.add_argument('--train_beta', type=float, default=1.0, help='')
@@ -82,8 +82,8 @@ def get_parser():
     parser.add_argument("--save_model", action="store_true", help="whether to save best model.")
     parser.add_argument('--active_ratio', type=float, default=0.02,
                         help='The ratio of labeled samples selected from target domain in each round(5 rounds).')
-    parser.add_argument("--active_type", type=str,
-                        choices=['detective', 'ldms', 'random', 'entropy', 'vus', 'bus'],
+    parser.add_argument("--active_type", type=str, default='random',
+                        # choices=['detective', 'ldms', 'random', 'entropy', 'margin', 'ldms2', 'ldms3'],
                         help="strategy for selecting samples to annotate")
     parser.add_argument("--phase", type=str, default='train', choices=['train', 'adapt'])
     parser.add_argument('--tsigma', default="2#4#8#16", type=str,
@@ -149,7 +149,24 @@ def test(model, test_loader):
     _, predict = torch.max(all_output, dim=1)
     acc = torch.sum(torch.squeeze(predict).float() == all_label).item() / float(all_label.size()[0])
 
-    return acc
+    # 计算混淆矩阵的TP, TN, FP, FN
+    # 假设正例是1，负例是0
+    TP = torch.sum((predict == 1) & (all_label == 1)).item()
+    TN = torch.sum((predict == 0) & (all_label == 0)).item()
+    FP = torch.sum((predict == 1) & (all_label == 0)).item()
+    FN = torch.sum((predict == 0) & (all_label == 1)).item()
+
+    # 正例的Precision, Recall, F1
+    precision_pos = TP / (TP + FP) if (TP + FP) > 0 else 0
+    recall_pos = TP / (TP + FN) if (TP + FN) > 0 else 0
+    f1_fake = 2 * (precision_pos * recall_pos) / (precision_pos + recall_pos) if (precision_pos + recall_pos) > 0 else 0
+
+    # 负例的Precision, Recall, F1
+    precision_neg = TN / (TN + FN) if (TN + FN) > 0 else 0
+    recall_neg = TN / (TN + FP) if (TN + FP) > 0 else 0
+    f1_real = 2 * (precision_neg * recall_neg) / (precision_neg + recall_neg) if (precision_neg + recall_neg) > 0 else 0
+
+    return acc, f1_fake, f1_real, predict == all_label
 
 
 def train(args, task):
@@ -160,34 +177,29 @@ def train(args, task):
     multi_source_loader, multi_source_iter = get_three_source_iter(args)
     tgt_train_ds, tgt_test_ds, tgt_select_ds = get_target_ds(args)
     _, tgt_train_iter = get_dataloader(args, tgt_train_ds, shuffle=True, drop_last=True, return_iter=True)
-    tgt_candidate_loader = get_dataloader(args, tgt_train_ds, shuffle=False, drop_last=False)
+    tgt_candidate_loader = get_dataloader(args, tgt_train_ds, shuffle=False, drop_last=False)  # ! ! !
     tgt_test_loader = get_dataloader(args, tgt_test_ds, shuffle=False, drop_last=False)
 
-    model = JointModel_TextCnn(out_size=256, num_label=2, freeze_id=args.freeze_resnet,
+    model = JointModel_TextCnn2(out_size=256, num_label=2, freeze_id=args.freeze_resnet,
                                d_prob=args.d_rop, kernel_sizes=[3, 4, 5], num_filters=100,
                                mode=args.textcnn_mode, dataset_name=args.dataset)
-
-    jmmd_loss = JointMultipleKernelMaximumMeanDiscrepancy(
-        kernels=(
-            [GaussianKernel(sigma=k, track_running_stats=False) for k in args.tsigma],
-            [GaussianKernel(sigma=k, track_running_stats=False) for k in args.vsigma]
-        ),
-        linear=args.linear,
-    )
-
-    intra_loss = Intro_alignment_loss(theta=args.intratheta, temperature=args.temperature, threshold=args.threshold,
-                                      input_dim=args.cls_dim, output_dim=args.cls_dim)
+    # intra_loss = Intro_alignment_loss(theta=args.intratheta, temperature=args.temperature, threshold=args.threshold,
+    #                                   input_dim=args.cls_dim, output_dim=args.cls_dim)
+    domain_discriminator_t = DomainDiscriminator(in_size=256, hidden_size=256, num_domains=4)
+    domain_discriminator_v = DomainDiscriminator(in_size=256, hidden_size=256, num_domains=4)
 
     model.cuda()
-    jmmd_loss.cuda()
-    intra_loss.cuda()
-
+    # intra_loss.cuda()
+    domain_discriminator_t.cuda()
+    domain_discriminator_v.cuda()
 
     parameters = model.get_param()
     for para in parameters:
         para["lr"] = args.lr
-    parameters += [{"params": jmmd_loss.parameters(), 'lr': args.lr}]
-    parameters += [{"params": intra_loss.parameters(), 'lr': args.lr}]
+    # parameters += [{"params": intra_loss.parameters(), 'lr': args.lr}]
+    parameters += [{"params": domain_discriminator_t.parameters(), 'lr': args.lr}]
+    parameters += [{"params": domain_discriminator_v.parameters(), 'lr': args.lr}]
+
 
     optimizer = optim.Adam(params=parameters, lr=args.lr, betas=(0.9, 0.999), eps=1e-8,
                            weight_decay=args.wd, amsgrad=True)
@@ -206,14 +218,16 @@ def train(args, task):
     best_acc = 0.0
     final_acc = 0.
     all_epoch_result = []
+    all_pred_res = []
     ckt_path = os.path.join(args.output_dir, args.dataset, task)
     os.makedirs(ckt_path, exist_ok=True)
     active_round = 1
 
     for epoch in range(1, args.train_epochs + 1):
         model.train()
-        jmmd_loss.train()
-        intra_loss.train()
+        # intra_loss.train()
+        domain_discriminator_t.train()
+        domain_discriminator_v.train()
 
         for batch_idx in range(args.max_iter):
             data_time = time.time() - end
@@ -230,10 +244,13 @@ def train(args, task):
 
             optimizer.zero_grad()
 
-            logits_s1, feats_s1 = model(train_texts=texts_s1, train_imgs=imgs_s1)
-            logits_s2, feats_s2 = model(train_texts=texts_s2, train_imgs=imgs_s2)
-            logits_s3, feats_s3 = model(train_texts=texts_s3, train_imgs=imgs_s3)
+            # through model forward to acquire features and logits
+            logits_s1, feats_s1, ct_data_s1 = model(train_texts=texts_s1, train_imgs=imgs_s1, labels=labels_s1)
+            logits_s2, feats_s2, ct_data_s2 = model(train_texts=texts_s2, train_imgs=imgs_s2, labels=labels_s2)
+            logits_s3, feats_s3, ct_data_s3 = model(train_texts=texts_s3, train_imgs=imgs_s3, labels=labels_s3)
             _, feats_t = model(train_texts=texts_t, train_imgs=imgs_t)
+
+            contrastive_data_list = [ct_data_s1, ct_data_s2, ct_data_s3]
 
             y_final = torch.cat([logits_s1[0], logits_s2[0], logits_s3[0]], dim=0)
             y_text = torch.cat([logits_s1[1], logits_s2[1], logits_s3[1]], dim=0)
@@ -242,14 +259,13 @@ def train(args, task):
 
             labels = torch.cat([labels_s1, labels_s2, labels_s3], dim=0)
 
-            feats_text = torch.cat([feats_s1[0], feats_s2[0], feats_s3[0]], dim=0)
-            feats_img = torch.cat([feats_s1[1], feats_s2[1], feats_s3[1]], dim=0)
-            feats_instance = torch.cat([feats_s1[2], feats_s2[2], feats_s3[2]], dim=0)
 
             if len(tgt_select_ds) > 0:
                 texts_tl, imgs_tl, label_tl = next(tgt_select_iter)
                 texts_tl, imgs_tl, label_tl = texts_tl.cuda(), imgs_tl.cuda(), label_tl.cuda()
-                logits_tl, feats_tl = model(train_texts=texts_tl, train_imgs=imgs_tl)
+                logits_tl, _, ct_data_t = model(train_texts=texts_tl, train_imgs=imgs_tl, labels=label_tl)
+
+                contrastive_data_list.append(ct_data_t)
 
                 y_final = torch.cat([y_final, logits_tl[0]], dim=0)
                 y_text = torch.cat([y_text, logits_tl[1]], dim=0)
@@ -258,42 +274,40 @@ def train(args, task):
 
                 labels = torch.cat([labels, label_tl], dim=0)
 
-                feats_text = torch.cat([feats_text, feats_tl[0]], dim=0)
-                feats_img = torch.cat([feats_img, feats_tl[1]], dim=0)
-                feats_instance = torch.cat([feats_instance, feats_tl[2]], dim=0)
+            # unpack contrast features and labels for all batches
+            aligned_text_feats, aligned_img_feats, aligned_instance, labels_list = zip(*contrastive_data_list)   # list
 
-            # ctindex = random.sample(list(np.arange(feats_text.size(0))), args.ctsize)
+            # compute Loss
+            contrast_loss = compute_contrastive_loss(args, aligned_text_feats, aligned_img_feats, aligned_instance, labels_list)
 
-            # cross_modal loss: all source {texts, imgs, labels, instances}
-            # contrast_loss, num_intra = intra_loss(feats_text[ctindex], feats_img[ctindex], labels[ctindex], feats_instance[ctindex])
-            contrast_loss, num_intra = intra_loss(feats_text, feats_img, labels, feats_instance)
-
-            # cross_domain loss: text+img {MMD(s1, t) + MMD(s2, t) + MMD(s3, t) + MMD(s1,s2) + MMD(s1, s3) + MMD(s2, s3)}
-            domain_align_loss = ((jmmd_loss((feats_s1[0], feats_s1[1]), (feats_t[0], feats_t[1])) +
-                                  jmmd_loss((feats_s2[0], feats_s2[1]), (feats_t[0], feats_t[1])) +
-                                  jmmd_loss((feats_s3[0], feats_s3[1]), (feats_t[0], feats_t[1]))) / 3 +
-                                 (jmmd_loss((feats_s1[0], feats_s1[1]), (feats_s2[0], feats_s2[1])) +
-                                  jmmd_loss((feats_s1[0], feats_s1[1]), (feats_s3[0], feats_s3[1])) +
-                                  jmmd_loss((feats_s2[0], feats_s2[1]), (feats_s3[0], feats_s3[1]))) / 3)
 
             final_ce_loss = F.cross_entropy(y_final, labels)
             separate_ce_loss = F.cross_entropy(y_text, labels) + F.cross_entropy(y_img, labels) + F.cross_entropy(y_fuse, labels)
+            ce_loss = final_ce_loss + 0.5 * separate_ce_loss
             nego_loss = compute_nego_loss(y_text, y_img, y_fuse, labels)
 
-            # meters.update(Loss_cross_modal=cross_modal_loss.item()) # modal loss : all source {texts, imgs, labels, instances}
-            meters.update(Loss_cross_domain=domain_align_loss.item())
+
+            adv_text_loss = compute_domain_adversarial_loss(domain_discriminator_t, feats_s1[0], feats_s2[0],
+                                                            feats_s3[0], feats_t[0])
+            adv_img_loss = compute_domain_adversarial_loss(domain_discriminator_v, feats_s1[1], feats_s2[1],
+                                                           feats_s3[1], feats_t[1])
+            adv_loss = adv_text_loss + adv_img_loss
+
+            meters.update(Loss_adversarial=adv_loss.item()) # modal loss : all source {texts, imgs, labels, instances}
+            meters.update(Loss_nego=nego_loss.item())
+            meters.update(Loss_modal_contrast=contrast_loss.item())
             meters.update(Loss_classifier=final_ce_loss.item())
 
-            total_loss = final_ce_loss + domain_align_loss * args.lambda1 + contrast_loss * args.lambda2
-            if args.loss_type == 1:
-                total_loss += 0
-            elif args.loss_type == 2:
-                total_loss += separate_ce_loss
-            elif args.loss_type == 3:
-                total_loss += 0.2 * nego_loss
-            elif args.loss_type == 4:
-                total_loss += separate_ce_loss + 0.2 * nego_loss
-
+            total_loss = ce_loss + 0.2 * nego_loss + 0.2 * adv_loss + 0.5 * contrast_loss
+            # total_loss = ce_loss + 0.2 * adv_loss + 0.5 * contrast_loss
+            # if args.loss_type == 1:
+            #     total_loss = ce_loss + 0.2 * nego_loss + 0.2 * adv_loss + 0.5 * contrast_loss
+            # elif args.loss_type == 2:
+            #     total_loss = ce_loss + 0.2 * nego_loss + 0.3 * adv_loss + 0.5 * contrast_loss
+            # elif args.loss_type == 3:
+            #     total_loss = ce_loss + 0.1 * nego_loss + 0.2 * adv_loss + 0.5 * contrast_loss
+            # elif args.loss_type == 4:
+            #     total_loss = ce_loss + 0.1 * nego_loss + 0.3 * adv_loss + 0.5 * contrast_loss
             total_loss.backward()
             optimizer.step()
             meters.update(Total_Loss=total_loss.item())
@@ -332,9 +346,10 @@ def train(args, task):
                 )
 
         if epoch % args.test_freq == 0:
-            testacc = test(model, tgt_test_loader)
+            testacc, f1_fake, f1_real, pred_res = test(model, tgt_test_loader)
             logger.info('Task: {} Train Epoch: {} testacc: {:.2f}'.format(task, epoch, testacc))
-            all_epoch_result.append({'train_epoch': epoch, 'acc': testacc})
+            all_epoch_result.append({'train_epoch': epoch, 'acc': testacc, 'f1_fake': f1_fake, 'f1_real': f1_real})
+            all_pred_res.append(pred_res)
             if testacc > best_acc:
                 best_acc = testacc
             final_acc = testacc
@@ -357,6 +372,8 @@ def train(args, task):
             active_round += 1
             logger.info('Task: {} Active Epoch: {}, samples num: {}, tgt_select_ds len:{}'.format(
                     task, epoch, len(active_samples), len(tgt_select_ds)))
+            # for case study
+            print(f'task/round: {task}/{active_round-1}, active_samples: {active_samples}')
 
 
     result_to_file(ckt_path, 'all_epoch_result.csv', all_epoch_result)
@@ -381,7 +398,15 @@ def train(args, task):
         plt.savefig(os.path.join(ckt_path, filename))
         plt.close()
 
-    return task, final_acc, best_acc
+    epoch_acc = [result['acc'] for result in all_epoch_result]
+    max_index = epoch_acc.index(max(epoch_acc))
+    top_three_acc = sorted(epoch_acc, reverse=True)[:3]
+    top3avg_acc = sum(top_three_acc) / len(top_three_acc)
+    f1_fake = all_epoch_result[max_index]['f1_fake']
+    f1_real = all_epoch_result[max_index]['f1_real']
+    print(f'task: {task}, pred_res: {all_pred_res[max_index]}')
+
+    return task, final_acc, best_acc, f1_fake, f1_real
 
 
 
@@ -421,8 +446,9 @@ def main():
             args.source = [domains[j] for j in index]
         print("source={}, target={}".format(args.source, args.target))
 
-        task, final_acc, best_acc = train(args, task=setting[i])
-        all_task_result.append({'task': task, 'final_acc': final_acc, 'best_acc': best_acc})
+        task, final_acc, best_acc, f1_fake, f1_real = train(args, task=setting[i])
+        all_task_result.append({'task': task, 'final_acc': final_acc, 'best_acc': best_acc,
+                                'f1_fake': f1_fake, 'f1_real': f1_real})
         print(all_task_result)
         logger.info('task: {} final_acc: {:.2f} best_acc: {:.2f} '.format(task, final_acc, best_acc))
 
