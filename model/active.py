@@ -105,54 +105,6 @@ def compute_density(features, uncertainties=None, max_increase=0.1):
     return densities
 
 
-def vus(model, features, select_num):
-    vat_loss = VATLoss()
-    lds, lds_each = vat_loss(model, features)
-    lds_each = lds_each.view(-1)
-    _, querry_indices = torch.topk(lds_each, select_num)
-    querry_indices = querry_indices.cpu()
-    return querry_indices
-
-
-def bus(model, features, select_num):
-
-    with torch.no_grad():
-        # Normalize features if needed (e.g., for cosine similarity)
-        # features_normalized = F.normalize(features, p=2, dim=1)
-        logits = model(features)  # Shape: (N, num_classes)
-        probs = F.softmax(logits, dim=1)  # Shape: (N, num_classes)
-
-    # entropy = -torch.sum(probs * torch.log(probs + 1e-7), dim=1)  # Shape: (N,)
-    # _, querry_indices = torch.topk(entropy, select_num)
-    # querry_indices = querry_indices.cpu()
-
-    entropy = -torch.sum(probs * torch.log(probs + 1e-7), dim=1)  # Shape: (N,)
-    num_classes = probs.shape[1]  # Number of classes
-    samples_per_class = [select_num // 2 for _ in range(2)]  # Number of samples to select per class
-
-    for c in range(num_classes):
-        # Get the indices of samples with the highest entropy for class c
-        class_indices = torch.where(torch.argmax(probs, dim=1) == c)[0]
-        class_entropy = entropy[class_indices]
-        # Select top samples with highest entropy in class c
-        if class_entropy.shape[0] < samples_per_class[c]:
-            samples_per_class[c] = class_entropy.shape[0]
-            samples_per_class[1-c] = select_num - samples_per_class[c]
-
-
-    querry_indices = []
-    for c in range(num_classes):
-        # Get the indices of samples with the highest entropy for class c
-        class_indices = torch.where(torch.argmax(probs, dim=1) == c)[0]
-        class_entropy = entropy[class_indices]
-
-        # Select top samples with highest entropy in class c
-        _, top_indices = torch.topk(class_entropy, samples_per_class[c], largest=True)
-        querry_indices.extend(class_indices[top_indices].cpu())
-
-    return querry_indices
-
-
 def get_feature(model, X, n_part=1):
     idx_layer = [i for i, layer in enumerate(model.model) if hasattr(layer, 'weight')][-1]
     m = X.shape[0]
@@ -502,49 +454,6 @@ def query_by_LDMS7(model, all_features, nQuery, ratio=2):
     return idx_ordered[idxs]
 
 
-def query_by_ablation2(model, all_features, nQuery):
-    text_f = all_features['text']
-    img_f = all_features['img']
-    fuse_f = all_features['fuse']
-
-    text_feature = get_feature(model.text_classifier, text_f)
-    text_feature = text_feature.cpu().numpy()
-    img_feature = get_feature(model.image_classifier, img_f)
-    img_feature = img_feature.cpu().numpy()
-    fuse_feature = get_feature(model.cat_classifier, fuse_f)
-    fuse_feature = fuse_feature.cpu().numpy()
-
-    D_mat = (cosine_distances(text_feature, text_feature) + cosine_distances(img_feature, img_feature) +
-             cosine_distances(fuse_feature, fuse_feature)) / 3
-
-    diversity_score = D_mat.mean(axis=1)
-
-    idxs = np.argsort(diversity_score)[-nQuery:][::-1]
-
-    return idxs
-
-def query_by_ablation_model(model, all_features, nQuery, ratio=2):
-
-    fuse_f = all_features['fuse']
-
-    ldm = get_ldm_gpu(model.cat_classifier, fuse_f)
-
-    idx_ordered = np.argsort(ldm)  # return idx_ordered[:nQuery]
-    ldm = ldm[idx_ordered]
-
-    idx_ordered = idx_ordered[:ratio * nQuery]
-    fuse_feature = get_feature(model.cat_classifier, fuse_f)
-    fuse_feature = fuse_feature[idx_ordered].cpu().numpy()
-
-    D_mat = cosine_distances(fuse_feature, fuse_feature)
-    # D_mat[D_mat < 1e-5] = 0
-    diversity_score = D_mat.mean(axis=1)
-    # score = gamma * np.log(1 + diversity_score)
-    idxs = np.argsort(diversity_score)[-nQuery:][::-1]
-
-    return idx_ordered[idxs]
-
-
 def active_select(tgt_candidate_loader, tgt_dataset, active_ratio, totality, model, t_step, active_type=None):
     lambda_1 = 7
     lambda_2 = 0.5
@@ -819,50 +728,6 @@ def active_select2(tgt_candidate_loader, tgt_dataset, active_ratio, totality, mo
 
         select_indices = [item[0] for item in first_stat]
 
-    elif active_type == 'EADA':
-        energy_beta = 1.0
-        first_sample_ratio = 0.5
-
-        with torch.no_grad():
-            for i, data in enumerate(tgt_candidate_loader):
-                tgt_text, tgt_img, tgt_lbl = data[0], data[1], data[2]
-                tgt_text, tgt_img, tgt_lbl = tgt_text.cuda(), tgt_img.cuda(), tgt_lbl.cuda()
-
-                _, _, tgt_out, _ = model(tgt_text, tgt_img)
-
-                # MvSM of each sample
-                # minimal energy - second minimal energy
-                min2 = torch.topk(tgt_out, k=2, dim=1, largest=False).values
-                mvsm_uncertainty = min2[:, 0] - min2[:, 1]
-
-                # free energy of each sample
-                output_div_t = -1.0 * tgt_out / energy_beta
-                output_logsumexp = torch.logsumexp(output_div_t, dim=1, keepdim=False)
-                free_energy = -1.0 * energy_beta * output_logsumexp
-
-                # for i in range(len(free_energy)):
-                #     first_stat.append([tgt_path[i], tgt_lbl[i].item(), tgt_index[i].item(),
-                #                        mvsm_uncertainty[i].item(), free_energy[i].item()])
-
-                for j in range(len(free_energy)):
-                    sample_id = i * 32 + j
-                    first_stat.append([sample_id, tgt_lbl[j].item(), mvsm_uncertainty[j].item(),
-                                       free_energy[j].item()])
-
-        first_sample_ratio = first_sample_ratio
-        first_sample_num = math.ceil(totality * first_sample_ratio)
-        second_sample_ratio = active_ratio / first_sample_ratio
-        second_sample_num = math.ceil(first_sample_num * second_sample_ratio)
-
-        # the first sample using \mathca{F}, higher value, higher consideration
-        first_stat = sorted(first_stat, key=lambda x: x[3], reverse=True)  # free_energy
-        second_stat = first_stat[:first_sample_num]
-
-        # the second sample using \mathca{U}, higher value, higher consideration
-        second_stat = sorted(second_stat, key=lambda x: x[2], reverse=True)
-        second_stat = second_stat[:second_sample_num]
-
-        select_indices = [item[0] for item in second_stat]
 
     elif active_type == 'entropy':
 
